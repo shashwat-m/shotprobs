@@ -13,6 +13,7 @@ from typing import List, Dict
 
 SLEEP = 0.6
 SEASON = "2023-24"
+LIMIT_PLAYERS = 40
 
 def get_team_ids():
     """
@@ -29,12 +30,6 @@ def get_team_roster_player_ids(team_id, season):
         per_mode_detailed="PerGame"
     ).get_data_frames()[0]
     return df["PLAYER_ID"].astype(int).tolist()
-
-def get_team_roster(team_id, season):
-    sleep(SLEEP)
-    list = [] * len(get_team_roster_player_ids(team_id, season))
-    for i in range(get_team_roster_player_ids(team_id, season)):
-        list.append()
         
 
 def get_player_name_from_id(player_id, season):
@@ -51,7 +46,7 @@ def build_player_dict(season):
         season=season,
         per_mode_detailed="PerGame"
     ).get_data_frames()[0]
-    return dict[zip(df["PLAYER_ID"].astype(int), df("PLAYER_NAME"))]
+    return dict(zip(df["PLAYER_ID"].astype(int), df["PLAYER_NAME"]))
 
 def get_active_player_ids():
     return [p["id"] for p in static_players.get_active_players()]
@@ -105,5 +100,49 @@ def search_players(partial: str, player_name_to_id: dict[str, int], limit: int =
     hits.sort(key=lambda x: (x[0].find(q), x[0]))
     return hits[:limit]
 
-name_to_id, id_to_name, _ = build_player_lookup(SEASON)
-print(get_player_shots(find_player_id("Malik Beasley", name_to_id), SEASON))
+def main():
+    pid2name = build_player_dict(SEASON)
+    pids = get_active_player_ids()
+    if LIMIT_PLAYERS:
+        pids = pids[:LIMIT_PLAYERS]
+    print(f"Fetching shots for {len(pids)} players. . .")
+    all_parts: List[pd.DataFrame] = []
+    for i, pid in enumerate(pids, 1):
+        try:
+            df = get_player_shots(pid, SEASON)
+            if not df.empty:
+                pname = pid2name.get(pid,"Unknown")
+                df["PLAYER_NAME"] = pname
+                all_parts.append(df)
+                if i % 25 == 0:
+                    print(f". . .{i} players processed")
+        except Exception as e:
+            print(f"[WARN] Player {pid2name.get(pid, pid)} ({pid}) failed : {e}")
+    if not all_parts:
+        print("No shots pulled")
+        return
+    
+    shots = pd.concat(all_parts, ignore_index=True)
+
+    # Useful columns to keep
+    keep = [
+        "GAME_ID","GAME_EVENT_ID","PLAYER_ID","PLAYER_NAME","TEAM_ID","TEAM_NAME",
+        "LOC_X","LOC_Y","SHOT_DISTANCE","SHOT_TYPE",
+        "SHOT_ZONE_BASIC","SHOT_ZONE_AREA","SHOT_ZONE_RANGE",
+        "PERIOD","MINUTES_REMAINING","SECONDS_REMAINING","GAME_DATE",
+        "ACTION_TYPE","EVENT_TYPE","HTM","VTM","SHOT_MADE_FLAG","SEASON",
+    ]
+    shots = shots[[c for c in keep if c in shots.columns]]
+
+    # Persist command
+    out_parquet = f"data_raw/shots_{SEASON.replace('-', '')}.parquet"
+    shots.to_parquet(out_parquet, index=False)
+
+
+    # Connect to DuckDB to process data
+    con = duckdb.connect("data_proc/nba.duckdb")
+    con.execute("CREATE TABLE IF NOT EXISTS shots AS SELECT * FROM read_parquet(?)", [out_parquet])
+    con.execute("INSERT INTO shots SELECT * FROM read_parquet(?)", [out_parquet])
+    con.close()
+
+    print(f"Saved {len(shots):,} shots to {out_parquet} and DuckDB.")
